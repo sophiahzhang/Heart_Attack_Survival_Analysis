@@ -1,0 +1,778 @@
+---
+title: 'COMP 152: Statistical Bioinformatics in R: Survival Analysis of Heart Attack Patients using Echocardiogram Data'
+author: "Sophia Zhang"
+output:
+  html_document:
+    df_print: paged
+---
+
+### Introduction
+
+Myocardial infarctions, more commonly known as heart attacks, is a serious health concern with 3 million cases per year in the US alone (Benjamin et al., 2019). Heart attacks are a leading cause of death among adults worldwide and contributes to economic losses and strain on the health care system. A heart attack was ranked in the top five most expensive in-hospital conditions to treat in 2011, with an average cost of $19,000 per hospital stay in the US (Torio, 2013). In many instances, heart attacks are preventable, especially with careful monitoring. Methods to predict the survival rate of the patient is key in allocating time and resources to those who need it most. 
+The echocardiogram is an ultrasound of the heart that provides moving images from which information on the structure and function of the heart can be determined. A score can be assigned based on the left ventricular segmental wall motion seen in the echocardiogram (a measure of how the segments of the left ventricle are moving). This wall motion score (WMS) can be used as a way to assess the condition of the left ventricle in patients who have or have had a heart attack. The score is the sum of scores of 13 segments of the left ventricle, each assigned a number based on the degree of systolic wall motion abnormality. 
+In the paper “Short and long term predictive value of wall motion score in acute myocardial infarction”, Kan et al. (1986) seeks to predict from certain variables whether or not a patient will survive at least one year after a heart attack. Specifically, the paper uses wall motion score as a predictive value for a patient’s mortality. The result of the paper was a single threshold value to predict 1 year survival, which led to a simple and effective prediction tool for this purpose. 
+The original data analyzed by Kan et al. (1986) are for 345 heart attack patients who had an echocardiogram taken upon admission to the hospital. The available dataset for this paper is a truncated version of the original, with only 132 patient observations. In the data, wall motion score and also wall motion score index is provided for each patient. The wall motion score index (WMSI) is calculated by dividing the score by the number of segments considered in each score (since not all 13 segments is always considered). Wall motion score index is often used instead since it is a better standardized variable than wall motion score. Klein et al. (2009) in their study of 101 patients found the optimal threshold value for predicting mortality was a WMSI of 2.19.  
+This paper is a combination of reanalysis of the work by Kan et al. and additional original analysis on the truncated dataset. The reanalysis portion involved applying the WMS threshold of 10 (optimal level as determined by Kan et al.) on the truncated dataset and comparing the predictive values. The optimal WMS threshold specific to the truncated dataset was also calculated. New analysis involved predicting probability of survival over time using the Kaplan-Meier estimator method. In addition, new machine learning algorithms such as logistic regression, random forest, and K Nearest Neighbors was applied for binary classification; to predict survival (yes or no) within a year of the heart attack. Age and other clinical data variables was added in the machine learning models. The accuracy of the models in predicting whether patients will die within a year was evaluated.
+
+
+### Preliminaries
+```{r}
+
+rm(list = ls(all.names = TRUE)) # will clear all objects, including hidden objects
+gc() # free up memory and report memory usage
+#Set working directory
+setwd('/Users/Sophia/COMP152/Project')
+```
+
+### Install libraries 
+
+```{r}
+# Packages 
+pacman::p_load(tidyverse, stringr, ggplot2, data.table, stargazer,caret)
+library(ggcorrplot)
+library(survival) #for Kaplan-Meier
+library(ranger) #for ML
+library(ggfortify) #for plotting survival
+library(ROCR) #for ROC  curves in ML
+```
+
+### Load the data
+Attribute Information (From data key):
+1. survival -- the number of months patient survived (has survived, if patient is still alive). Because all the patients had their heart attacks at different times, it is possible that some patients have survived less than one year but they are still alive. Check the second variable to confirm this. Such patients cannot be used for the prediction task mentioned above. 
+2. still-alive -- a binary variable. 0=dead at end of survival period, 1 means still alive 
+3. age-at-heart-attack -- age in years when heart attack occurred 
+4. pericardial-effusion -- binary. Pericardial effusion is fluid around the heart. 0=no fluid, 1=fluid 
+5. fractional-shortening -- a measure of contracility around the heart lower numbers are increasingly abnormal 
+6. epss -- E-point septal separation, another measure of contractility. Larger numbers are increasingly abnormal. 
+7. lvdd -- left ventricular end-diastolic dimension. This is a measure of the size of the heart at end-diastole. Large hearts tend to be sick hearts. 
+8. wall-motion-score -- a measure of how the segments of the left ventricle are moving 
+9. wall-motion-index -- equals wall-motion-score divided by number of segments seen. Usually 12-13 segments are seen in an echocardiogram. Use this variable INSTEAD of the wall motion score. 
+10. mult -- a derivate var which can be ignored 
+11. name -- the name of the patient (I have replaced them with "name") 
+12. group -- meaningless, ignore it 
+13. alive-at-1 -- Boolean-valued. Derived from the first two attributes. 0 means patient was either dead after 1 year or had been followed for less than 1 year. 1 means patient was alive at 1 year
+```{r}
+# Load data
+raw <- read.csv("echocardiogram.csv")
+
+# Look at variable names
+names(raw)
+
+table(raw$aliveat1)
+
+#Look at count of missing values
+apply(is.na(raw),2,sum)
+```
+### Data cleaning 
+mult: drop column, not applicable
+name: drop column, patient names are not applicable
+group: drop column, not applicable
+
+aliveat1: can fix the NA's and wrong values by using 'survival' and 'still-alive' to derive
+if survival>=12 then aliveat1 =1 
+if survival< 12 & alive =0 then aliveat1 = 0
+if survival < 12 & alive=1 then aliveat1 =2 (patient followed for less than 1 year)
+
+```{r}
+#Drop unneeded columns and fix target column
+samples<-raw%>%
+  select(-c(mult,name,group))%>%
+  #mutate(died_hosp=ifelse(survival<1&alive==0,1,0))%>%
+  #mutate(died_3mon=ifelse(survival>=1 & survival<=3 & alive==0,1,0))%>%
+  #mutate(died_1yr=ifelse(survival>3 & survival<=12 & alive==0,1,0)) %>%
+  mutate(aliveat1=ifelse(survival>12,1,ifelse(survival<12&alive==1,2,0)))%>%
+  #filter(aliveat1!=2) %>% #drop followed less than 1 yr
+  filter(!is.na(aliveat1)) #%>% #drop rows if aliveat1 NA
+  #mutate(type=ifelse(aliveat1==1,'survivor','non_survivor')) #add type description
+  
+summary(samples)
+```
+```{r}
+#Calculating raw column means to use in next step
+mean_age<-mean(raw$age[!is.na(raw$age)])
+mean_fracshort<-mean(raw$fractionalshortening[!is.na(raw$fractionalshortening)])
+mean_epss<-mean(raw$epss[!is.na(raw$epss)])
+mean_lvdd<-mean(raw$lvdd[!is.na(raw$lvdd)])
+
+#Look at count of missing values
+apply(is.na(samples),2,sum)
+```
+
+### Treatment of missing values.
+There are a several missing values (NA) in each column, because the dataset is small, don't want to drop all the rows with NA.
+wallmotion.score: since index is the average, can back calculate score from wallmotion.index by multiplying by 13 (number of segments).
+If both score and index are missing, drop the row.
+for age,fractionalshortening, epss,lvdd: replace NA with raw sample means
+```{r}
+#Fix NAs
+samples<-samples%>%
+  mutate(wallmotion.score=ifelse(is.na(wallmotion.score),wallmotion.index*13,wallmotion.score)) %>%
+  mutate(age=ifelse(is.na(age),mean_age,age))%>%
+  mutate(fractionalshortening=ifelse(is.na(fractionalshortening),mean_fracshort,fractionalshortening))%>%
+  mutate(epss=ifelse(is.na(epss),mean_epss,epss))%>%
+  mutate(lvdd=ifelse(is.na(lvdd),mean_lvdd,lvdd))%>%
+  filter(!is.na(wallmotion.score)) #drop rows if wallmotion.score NA
+
+summary(samples)
+
+#Look at the numbers of survivors
+table(samples$aliveat1)
+
+```
+
+```{r}
+samples %>% 
+  ggplot(aes(x = wallmotion.score)) +
+   geom_density(alpha=0.7,fill = 'purple') +
+  geom_vline(xintercept=mean(samples$wallmotion.score), col='black',linetype = "dashed",size=1)+
+   #facet_wrap(~type) +
+  # theme(axis.text.x = element_text(angle = 90)) +
+   labs(x = "Wall motion score (WMS)",title='Wall motion score (WMS) of All Patients')
+```
+```{r}
+#QQplot
+qqnorm(samples$wallmotion.score);qqline(samples$wallmotion.score)
+
+```
+
+
+### Add categorical columns for comparison with paper
+Paper only deals with patients who died or were followed in 1 year, to look at survival analysis, we drop observation if patient was followed less than 1 yr.
+New variables:
+died_hosp: indicates if patient died in hospital (assume survival <1month and not alive at end of survival period)
+died_3mon: indicates if patient died <= 3 months after heart attack
+type: string categorical variable for survivor (aliveat1=1) or nonsurvivor (aliveat1=0)
+```{r}
+#Add categorical columns
+heart<-samples%>%
+  mutate(died_hosp=ifelse(survival<1&alive==0,1,0))%>%
+  mutate(died_3mon=ifelse(survival>=1 & survival<=3 & alive==0,1,0))%>%
+  mutate(died_1yr=ifelse(survival>3 & survival<=12 & alive==0,1,0)) %>%
+  filter(aliveat1!=2) %>% #drop if followed less than 1 yr
+  mutate(type=ifelse(aliveat1==1,'survivor','non_survivor')) #add type description
+
+summary(heart)
+```
+
+```{r}
+#Plot distribution of wall motion score for cleaned data
+heart %>% 
+  ggplot(aes(x = wallmotion.score)) +
+   geom_density(alpha=0.7,fill = 'purple') +
+  geom_vline(xintercept=mean(heart$wallmotion.score), col='black',linetype = "dashed",size=1)+
+   #facet_wrap(~type) +
+   #theme(axis.text.x = element_text(angle = 90)) +
+   labs(x = "Wall motion score (WMS)",title='Wall motion score (WMS) of Non-Censored Samples')
+```
+
+### Compare distribution of WMS and mortality rate to paper
+From Paper: 
+	            No	Mean	SD	Range
+Survivors	    276	5.7	  3.9*	(-3, 21)
+Non-survivors	69	16.2	5.9*	(-2, 26)
+
+Mortality rate = 69/345=20%
+```{r}
+
+#Group data by type and calculate mean of wall motion score
+survivors_WMS<-heart %>% 
+   group_by(type) %>% 
+   summarize(count=n(),mean=mean(wallmotion.score),std_dev=sd(wallmotion.score),median=median(wallmotion.score), min=min(wallmotion.score),max=max(wallmotion.score))%>% 
+   column_to_rownames(., var = "type") #rename index
+#print as matrix
+print(as.matrix(survivors_WMS))
+
+#Calculate mortality rate
+print(paste('total mortality rate (%) is ',round(8/(8+88)*100,digits=2)))
+
+#The mortality rate is much smaller than 20%, but closer to the population mortality rate estimated by the paper of 9-11%.
+#However there does not seem to be a distinct difference between the mean WMS of survivors and non-survivors.
+```
+
+Distributions of the groups in boxplot
+```{r}
+#Plot distributions of survivors and non survivors
+
+boxplot1<-heart %>% 
+  ggplot(aes(x = type, y = wallmotion.score)) +
+   geom_boxplot()+
+   labs(y = "Wall motion score (WMS)",title='WMS Distribution of Non Survivors vs Survivors')
+boxplot1
+
+```
+
+
+The p-value is 0.06152 (1 sided test for WMS of survivor < WMS non survivor) so at the 5% significance level we fail to reject the null hypothesis of equal means; we cannot conclude that the survivors group WMS is smaller than the non survivors group WMS.
+
+Assume independent samples with 2 unequal and unknown variances (we know this from the original paper). The p-value is 0.123 so at the 5% significance level we fail to reject the null hypothesis of equal means, meaning that we cannot conclude that the survivors group WMS is significantly different than the non survivors group WMS.
+
+```{r}
+#Student's t-test of equal means
+#Null hypotheses: mu(survivor)=mu(non-survivor)
+#alternative hypothesis is H1: mu(survivor, died_1yr=0)!=mu(non-survivor, died_1yr=1)
+
+#If testing WMS of survivor < WMS non survivor use
+#alternative hypothesis is H1: mu(survivor, died_1yr=0)<mu(non-survivor, died_1yr=1)
+
+test <- t.test(wallmotion.score ~ died_1yr,
+  data = heart,
+  var.equal = FALSE,
+  alternative = "less"
+)
+test
+```
+
+```{r}
+qqnorm(heart$wallmotion.score);qqline(heart$wallmotion.score)
+qqnorm(log(heart$wallmotion.score));qqline(log(heart$wallmotion.score))
+```
+
+
+```{r}
+#Plot distribution of wall motion score by group type
+heart %>% 
+  ggplot(aes(x = wallmotion.score)) +
+   geom_histogram(bins=50,fill = 'purple') +
+   facet_wrap(~type) +
+   theme(axis.text.x = element_text(angle = 90)) +
+   labs(x = "Wall motion score (WMS)",title='WMS of Non Survivors vs Survivors at 1 Year')
+```
+```{r}
+#Plot distribution of simulated wall motion score using statistics from paper
+set.seed(200010)
+
+paperdata<-data.frame(survivor=rnorm(1000,mean=5.7,sd=3.9),non_survivor=rnorm(1000,mean=16.2,sd=5.9))
+
+paperdata_plot<-pivot_longer(data=paperdata, cols=1:2, names_to='type', values_to='wallmotion.score')
+```
+
+
+```{r}
+#Plot distribution of simulated wall motion score using statistics from paper
+plot1<-paperdata_plot %>% 
+  ggplot(aes(x = wallmotion.score, col=type,fill=type)) +
+   geom_density(alpha=0.7) +
+  geom_vline(xintercept=10, col='black',linetype = "dashed",size=1)+
+    theme(legend.position=c(0.80, 0.8))+
+   #theme_bw(base_size = 6) +
+   labs(x = "Wall motion score (WMS)",title='Original Paper: WMS of Non Survivors vs Survivors')
+plot1
+```
+
+```{r}
+#Plot distribution of wall motion score
+plot2<-heart %>% 
+  ggplot(aes(x = wallmotion.score, col=type, fill=type)) +
+   geom_density(alpha=0.7) +
+  geom_vline(xintercept=10, col='black',linetype = "dashed",size=1)+
+  theme(legend.position=c(0.80, 0.8))+
+   labs(x = "Wall motion score (WMS)",title='Truncated Sample: WMS of Non Survivors vs Survivors')
+
+plot2
+```
+```{r}
+#Plot distribution of age
+plot2_1<-heart %>% 
+  ggplot(aes(x = age, col=type, fill=type)) +
+   geom_density(alpha=0.7) +
+  geom_vline(xintercept=60, col='black',linetype = "dashed",size=1)+
+  theme(legend.position=c(0.80, 0.8))+
+   labs(x = "Age (years)",title='Truncated Sample: Age of Non Survivors vs Survivors')
+
+plot2_1
+```
+
+
+```{r}
+#Group data by type and calculate mean of wall motion index
+surv_index<-heart %>% 
+   group_by(type) %>% 
+   summarize(count=n(),mean=mean(wallmotion.index),std_dev=sd(wallmotion.index),median=median(wallmotion.index), min=min(wallmotion.index),max=max(wallmotion.index))%>% 
+   column_to_rownames(., var = "type") #rename index
+#print as matrix
+print(as.matrix(surv_index))
+
+#Calculate mortality rate
+print(paste('total mortality rate (%) is ',round(8/(8+88)*100,digits=2)))
+
+#The mortality rate is much smaller than 20%, but closer to the population mortality rate estimated by the paper of 9-11%.
+#However there does not seem to be a distinct difference between the mean WMS of survivors and non-survivors.
+
+#Plot distribution of wall motion index
+heart %>% 
+  ggplot(aes(x = wallmotion.index)) +
+   geom_histogram(bins=50,fill = 'purple') +
+   facet_wrap(~type) +
+   theme(axis.text.x = element_text(angle = 90)) +
+   labs(x = "Wall motion Index (WMI)",title='WMI of Non Survivors vs Survivors at 1 Year')
+
+```
+
+### Bootstrap sampling
+Because the data available is truncated, it does not match the statistics give in the original paper. Based on this, we can take a bootstrap approach to resample from the data to get a sample as described in the paper.
+```{r}
+#nonparametric bootstrap resampling
+
+#i) 95% CI for mean WMS = [15,20]
+  #Interval does NOT include zero
+
+#create subset of data for counts
+survivor <- heart%>%filter(type=='survivor')
+#Draw 1000 samples of median of sample size N
+B = 1000
+survivor
+
+#create vector for WMS
+WMS1<-survivor$wallmotion.score
+N=as.numeric(length(WMS1))
+#look at median
+print(mean(WMS1))
+
+# Sample N times with replacement from WMS1
+means_WMS1 <- replicate(B, {
+  indices <- sample(1:N, N, replace = TRUE)
+  mean(WMS1[indices])
+})
+
+#Calculate 95% Confidence Interval (2-sided)
+WMS1_CI<-list(quantile(means_WMS1, .025),quantile(means_WMS1, .975))
+print(paste('WMS survivors 95% CI is ', WMS1_CI))
+print(paste('WMS survivors mean is ', mean(means_WMS1)))
+#95% CI is [12.6 14.17] therefore the sample for survivors is not representative of the population (here referred to as the sample in the paper)
+```
+```{r}
+#i) 95% CI for mean WMS = [15,20]
+  #Interval does NOT include zero
+
+#create subset of data for counts
+n_survivor <- heart%>%filter(type=='non_survivor')
+#Draw 1000 samples of median of sample size N
+B = 1000
+
+#create vector for WMS
+WMS2<-n_survivor$wallmotion.score
+N2=as.numeric(length(WMS2))
+#look at median
+print(mean(WMS2))
+
+# Sample N times with replacement from WMS1
+means_WMS2 <- replicate(B, {
+  indices <- sample(1:N2, N2, replace = TRUE)
+  mean(WMS2[indices])
+})
+
+#Calculate 95% Confidence Interval (2-sided)
+WMS2_CI<-list(quantile(means_WMS2, .025),quantile(means_WMS2, .975))
+print(paste('WMS non survivors 95% CI is ', WMS2_CI))
+print(paste('WMS non survivors mean is ', mean(means_WMS2)))
+#95% CI is [12.6 14.17] therefore the sample for survivors is not representative of the population (here referred to as the sample in the paper)
+```
+
+
+Using the threshold of WMS>=10 in the paper, we will try to calculate the specificity, sensitivity using this sample.
+
+```{r}
+#Add prediction column
+#prediction=1 if predict dead within 1 year 
+#prediction=0 if predict alive within 1 year
+#Compare with died_1yr column
+
+heart<-heart%>%
+  mutate(predWMS10=ifelse(wallmotion.score>=10,1,0))
+
+# Create an error matrix for each of the classifiers
+errorM <- confusionMatrix(as.factor(heart$predWMS10),as.factor(heart$died_1yr))
+
+#as.matrix(errorM, what = "xtabs") #overall, classes
+
+ggplot(as.data.frame(errorM$table), aes(Prediction,sort(Reference,decreasing = T), fill= Freq)) +
+        geom_tile() + geom_text(aes(label=Freq)) +
+        scale_fill_gradient(low="white", high="#009194") +
+        labs(x = "Prediction",y = "Reference") +
+        scale_x_discrete(labels=c("survive","not survive")) +
+        scale_y_discrete(labels=c("not survive","survive"))
+
+```
+We can see that using a WMS of 10, 100% of the people the model predicts will die within 1 year actually dies.
+However, only 9% of the people the model predicts will live actually lives. This is not a good predictive model because 91% of the people who we tell will live do not make it. This may be lost opportunity for preventative care.
+
+```{r}
+#Look at key values
+#print(errorM$table)
+print(errorM$byClass)
+```
+
+### New Analysis
+Because the results of this truncated dataset cannot be compared to the paper, we can approach it in a new direction. Since the WMS alone is not a good predictor of survival, let's look at predicting using other variables or combinations of variables.
+First we can look at any correlations between variables.
+
+```{r}
+#Correlation matrix
+cols <- c("survival",  "age" ,"pericardialeffusion","fractionalshortening", "epss","lvdd", "wallmotion.score","wallmotion.index")#,"aliveat1","died_1yr") #take numeric variable columns
+
+heart_meas <- heart %>% select(all_of(cols))
+corr <- round(cor(heart_meas, use="complete.obs"), 2)
+ggcorrplot(corr, lab = TRUE, colors = c("aquamarine", "white", "dodgerblue","blue"), 
+           show.legend = T, outline.color = "gray", type = "upper", 
+           tl.cex = 15, lab_size = 3.5, sig.level = 0.1,
+           title = "Correlation Matrix of Heart Attack Data") +
+  labs(fill = "Correlation") + 
+  theme(axis.text.x = element_text(size=8,margin=margin(-2,0,0,0)),  
+        axis.text.y = element_text(size=8,margin=margin(0,-2,0,0)),
+        panel.grid.major=element_blank())
+
+```
+It looks like survival is slightly correlated with WMS, lvdd, epss, and fractional shortening.
+There may be collinearity of lvdd and epss.
+Only one of wallmotion.index or wallmotion.score can be used
+
+## Let's predict probability of survival using Kaplan-Meier Estimator
+```{r}
+#Kaplan-Meier Estimator
+
+#Modify dataframe
+#Add a new variable for dead: 1 if death was observed, 0 if patient still alive (censored data)
+
+samples<-samples%>%
+  mutate(dead=ifelse(alive==0,1,0))
+
+# Kaplan Meier Survival Curve with Surv(time of survival,status of death)
+km <- with(samples, Surv(survival, dead))
+head(km,10)
+```
+
+
+```{r}
+#Fit the survival curve
+#Calculate probability of survival at intervals of 1 month, 3 months, 6 months, and every 6 months after
+#survival is probability of survival in the output, not to be confused with survival (months) in data
+km_fit <- survfit(Surv(survival, dead) ~ 1, data=samples)
+summary(km_fit, times = c(1,3,6*(1:10)))
+```
+
+
+```{r}
+#Plot the curve
+#plot(km_fit, xlab="Months", main = 'Kaplan Meyer Plot') #in base graphics
+autoplot(km_fit, xlab="Time (months)",ylab="Probability of Survival (%)",main='Kaplan Meier Estimate for all Patients')+
+  scale_x_continuous(name="Time (months)", breaks=seq(0,60,6))
+```
+```{r}
+#Calculate by WMS group
+#create a new column to indicate WMS threshold>13
+samples<-samples%>%
+  mutate(WMS10=ifelse(wallmotion.score>=10,'WMS>10','WMS<10'))
+
+km_trt_fit <- survfit(Surv(survival, dead) ~ WMS10, data=samples)
+plot3<-autoplot(km_trt_fit, xlab="Time (months)",ylab="Probability of Survival (%)",main='Kaplan Meier Estimate by WMS Group')+theme(legend.position=c(0.10, 0.2))+
+   scale_x_continuous(name="Time (months)", breaks=seq(0,60,6))
+plot3
+```
+
+```{r}
+#Calculate by WMS group using median of wallmotion score of survivors
+#create a new column to indicate WMS threshold>13
+samples<-samples%>%
+  mutate(WMS13=ifelse(wallmotion.score>=13,'WMS>13','WMS<13'))
+
+km_trt_fit2 <- survfit(Surv(survival, dead) ~ WMS13, data=samples)
+plot4<-autoplot(km_trt_fit2,xlab="Time (months)",ylab="Probability of Survival (%)",main='Kaplan Meier Estimate by WMS Group')+theme(legend.position=c(0.10, 0.2))+
+     scale_x_continuous(name="Time (months)", breaks=seq(0,60,6))
+
+plot4
+```
+
+```{r}
+#Calculate by pericardialeffusion
+#create a new column to indicate WMS threshold
+
+km_trt_fit3 <- survfit(Surv(survival, dead) ~ pericardialeffusion, data=samples)
+autoplot(km_trt_fit3)
+```
+```{r}
+#Calculate by WMS group
+#create a new column to indicate WMS threshold
+
+samples<-samples%>%
+  mutate(age60=ifelse(age>=60,'Age>60','Age<60'))%>%
+  #mutate(epss10=ifelse(lvdd>=4.69,'epss>20','epss<20'))%>%
+  mutate(epss10=ifelse(fractionalshortening>=0.23,'epss>20','epss<20'))
+
+km_trt_fit4 <- survfit(Surv(survival, dead) ~ age60, data=samples)
+plot5<-autoplot(km_trt_fit4,xlab="Time (months)",ylab="Probability of Survival (%)",main='Kaplan Meier Estimate by Age Group')+theme(legend.position=c(0.10, 0.2))+
+  scale_x_continuous(name="Time (months)", breaks=seq(0,60,6))
+plot5
+```
+### Use machine learning algorithms to predict if patient dies within 1 year
+
+There is a sample imbalance between the survivors and non survivors group.
+Using the 'heart' dataframe (samples without censored data), let's do some oversampling and undersampling to generate a dataset for training and prediction
+
+Based on the correlation matrix, the variables we are interested in are wallmotion.index (WMI), age, pericardialeffusion, fractional shortening, epss, and lvdd. The target variable is died_1yr
+
+```{r}
+#bootstrap resampling
+#Current sample: 
+#survivors=8 (8.3%)
+#non-survivors=88 (91.7%)
+
+#Target sample:
+#survivors=48 (50%%)
+#non-survivors=48 (50%)
+
+#i) over resampling for non-survivors (died_1yr=1)
+
+#create subset of data
+non_survivor_resample <- heart%>%filter(type=='non_survivor')
+#Draw 48 samples 
+B = 48
+
+N=as.numeric(length(non_survivor_resample$died_1yr))
+set.seed(200010)
+indices_n <- sample(1:N, B, replace = TRUE)
+
+non_survivor <- non_survivor_resample[as.vector(indices_n),]
+
+#i) under resampling for non-survivors (died_1yr)
+
+#create subset of data
+survivor_resample <- heart%>%filter(type=='survivor')
+#Draw 48 samples 
+M=as.numeric(length(survivor_resample$died_1yr))
+
+set.seed(200010)
+indices_s <- sample(1:M, B, replace = FALSE)
+
+survivors <- survivor_resample[as.vector(indices_s),]
+
+#Combines into one dataframe
+heart_ml<-rbind(survivors,non_survivor)
+head(heart_ml)
+```
+
+```{r}
+#Select columns of interest
+ml_cols <- c("age" ,"pericardialeffusion","fractionalshortening", "epss","lvdd", "wallmotion.index","died_1yr") #take variable columns
+
+heart_ml <- heart_ml %>% select(all_of(ml_cols))
+
+#Reset index
+rownames(heart_ml) <- NULL
+
+#We will use a train-test split of 70:30
+#67 samples will be used from training the rest (29) will be used for testing,
+set.seed(200010)
+indices_ml <- sample(1:96, 96, replace = FALSE)
+
+train_data <- heart_ml[as.vector(indices_ml[1:67]),]
+test_data <- heart_ml[as.vector(indices_ml[68:96]),]
+
+table(train_data$died_1yr)
+
+```
+
+# First we will create a general linear model
+
+```{r}
+#Logistic Regression
+
+#convert died_1yr and pericardialeffusion categories into a factor to 
+#indicate that it should be treated as a categorical value
+train_data$died_1yr<-factor(train_data$died_1yr)
+train_data$pericardialeffusion<-factor(train_data$pericardialeffusion)
+
+#Logit model with all variables
+logistic_model <- glm(died_1yr ~., data=train_data, family=binomial("logit"), maxit=500) 
+
+
+#Output summary info of our model:
+print(summary(logistic_model))
+#First output is the call to the model
+#Next are the deviance residuals, which is effectively a measure of model fit
+#Summaries of the deviance statistic is what we can use to assess model fitness 
+#Next the coefficients are displayed with their standard errors, z-stat (also
+#known as Wald z-stat, and the associated p-values
+#Everything with *** or ** is significant, 
+#Logistic regression coefficients give the change in the log odds of the outcome
+#for a one unit increase in the predictor value
+
+#It appears only wallmotion.index is significant (at a level of 0.05)
+```
+
+```{r}
+#Use the test_data to test
+#Factor categorical variables
+test_data$died_1yr<-factor(test_data$died_1yr)
+test_data$pericardialeffusion<-factor(test_data$pericardialeffusion)
+
+#first remove the died_1yr target column from test_data
+test <- test_data%>%
+      select(-died_1yr)
+
+#answers for corresponding samples
+#answers <- subset(test_data,select=died_1yr)
+answers <- test_data%>%
+      select(died_1yr)
+```
+
+
+```{r}
+#Calculate predictive accuracy:
+
+#predicted probabilities for the samples in the test data P(y=died_1yr)
+p <-predict(logistic_model, newdata=test, type="response")
+
+#If the predicted probability p is >0.5 assign 1, else assign 0 (this gives the categorical binary variable)
+results <-ifelse(p >0.5,1,0)
+
+#calculate the mean of the results that are not correct (% incorrect error)
+err <- mean(results != answers$died_1yr)
+
+#Accuracy is a measure of the number of correctly classified labels
+print(paste('Accuracy',1-err))
+
+#compare predicted probabilities with the answers (from ROCR package)
+pr <- prediction(p, answers$died_1yr)
+
+#calculate and plot ROC: true positive rate and false positive rate
+perf <- performance(pr,measure = 'tpr',x.measure = 'fpr')
+tpr <- perf@y.values[[1]] #true positive rate
+fpr <- perf@x.values[[1]] #false positive rate
+
+df <- data.frame(tpr = c(tpr), fpr=c(fpr)) #alpha=c(perf@alpha.values[[1]]))
+
+plt<-ggplot(aes(x=fpr, y=tpr), data=df) + geom_line()
+print(plt)
+
+plt
+
+#calculate the AUC value for ROC
+auc <- performance(pr, measure="auc")
+
+print(auc@y.values) #This area under the curve. 
+
+#Calculate and plot sensitivity and specificity
+perf1 <-performance(pr, "sens","spec")
+print(plot(perf1))
+
+#Calculate and plot precision and recall
+perf2 <-performance(pr, "prec","rec")
+print(plot(perf2))
+
+
+```
+```{r}
+logROC<-roc(response = answers$died_1yr, predictor = results)
+#plot(logROC, type="S", print.thres= 0.5)
+ggroc(logROC)
+
+confusionMatrix(data = factor(results), reference = test_data$died_1yr)
+```
+
+KNN
+
+```{r}
+#KNN Training and Control
+set.seed(200010)
+#Set cross validation
+ctrl <- trainControl(method="repeatedcv",repeats = 3) #,classProbs=TRUE,summaryFunction = twoClassSummary)
+
+#Fit with all variables, apply preprocessing steps to center and scale the data for KNN
+knnFit <- train(died_1yr ~ ., data = train_data, method = "knn", trControl = ctrl, preProcess = c("center","scale"), tuneLength = 20)
+
+#Output of kNN fit
+knnFit
+```
+
+```{r}
+#Plotting yields Number of Neighbours Vs accuracy (based on repeated cross validation)
+plot(knnFit)
+```
+
+```{r}
+knnPredict <- predict(knnFit,newdata = test )
+#Get the confusion matrix to see accuracy value and other parameter values
+confusionMatrix(knnPredict, test_data$died_1yr )
+
+mean(knnPredict == test_data$died_1yr)
+
+```
+
+```{r}
+library(pROC)
+#Predicted probabilities
+knnPredict2 <- predict(knnFit,newdata = test , type="prob")
+#knnROC2<-roc(response = test_data$died_1yr, predictor = knnPredict2[,2])
+knnROC <- roc(response =test_data$died_1yr,predictor=as.numeric(as.character(knnPredict)))#, levels = rev(test_data$died_1yr))
+knnROC
+
+plot(knnROC, type="S", print.thres= 0.5)
+  
+#ggroc(knnROC)
+
+```
+
+```{r}
+#Random Forest
+set.seed(200010)
+ctrl <- trainControl(method="repeatedcv",repeats = 3)#,classProbs=TRUE,summaryFunction = twoClassSummary)
+rfFit <- train(died_1yr ~ ., data = train_data, method = "rf", trControl = ctrl, preProcess = c("center","scale"), tuneLength = 20)
+
+#Output of rf fit
+rfFit
+```
+
+
+```{r}
+rfPredict <- predict(rfFit,newdata = test)
+rfPredict2 <- predict(rfFit,newdata = test , type="prob")
+rfROC <- roc(response =test_data$died_1yr,predictor=as.numeric(as.character(rfPredict)))#, levels = rev(test_data$died_1yr))
+
+plot(rfROC, type="S", print.thres= 0.5)
+```
+
+
+```{r}
+confusionMatrix(data = rfPredict, reference = test_data$died_1yr)
+
+```
+
+```{r}
+
+#Generate most important variables
+rfImp <- varImp(rfFit, scale = FALSE)
+rfImp
+```
+
+```{r}
+#Area under ROC curve for each variable
+roc_imp <- filterVarImp(x = train_data[, -ncol(train_data)], y =as.numeric(as.character(train_data$died_1yr)))
+head(roc_imp)
+```
+
+
+```{r}
+#Plot of most important variable scores
+plot(rfImp, top = 6)
+```
+
+```{r}
+#Compare AUC, positive rate, negative rate
+
+g <- ggroc(list(KNN=knnROC, Logistic_Regression=logROC, RF=rfROC), aes = "color", legacy.axes = TRUE) +
+  geom_abline() +
+  theme_classic() +
+  ggtitle("ROC Curves for Logistic Regression, KNN, and Random Forest Models") +
+  labs(x = "1 - Specificity",
+       y = "Sensitivity",
+       color = "Model Type")
+g
+
+```
+
+
+
+
+
+
+
